@@ -1,4 +1,4 @@
-<img src="./banner.jpg" alt="Banner" width="100%" />
+<img src="./banner.jpg" alt="Banner" height="80%" width="100%" />
 
 ### The Deep Field
 
