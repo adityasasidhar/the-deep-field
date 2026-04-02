@@ -11,5 +11,4 @@
 1. We take a set of prompts: 
    1. set of questions and problems that the llm will have seen before in its pretraining
    2. set of questions the llm has never seen before
-   3. 
    comapare confidence with recollect and and general problem solving ability
