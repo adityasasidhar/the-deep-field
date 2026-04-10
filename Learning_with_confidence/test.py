@@ -449,17 +449,17 @@ def main() -> None:
 
         if step % train_config.print_every == 0 or step == 1:
             avg = train_config.gradient_accumulation_steps
-            message = (
-                f"step={step:04d} stage={active_stage.name} "
-                f"loss={running_loss / avg:.4f} reward={running_reward / avg:.4f} "
-                f"clip={loss_dict['clip_loss'].item():.4f} "
-                f"entropy={loss_dict['entropy_reg'].item():.4f} "
-                f"seq_logprob={loss_dict['seq_logprob'].item():.4f} "
-                f"sign_mean={loss_dict['sign_mean'].item():.4f}"
+            logging.info(
+                "step=%04d stage=%s loss=%.4f reward=%.4f clip=%.4f entropy=%.4f seq_logprob=%.4f sign_mean=%.4f",
+                step,
+                active_stage.name,
+                running_loss / avg,
+                running_reward / avg,
+                loss_dict["clip_loss"].item(),
+                loss_dict["entropy_reg"].item(),
+                loss_dict["seq_logprob"].item(),
+                loss_dict["sign_mean"].item(),
             )
-            logging.info(message)
-            logging.info("  target=%r", batch[0]["answer"])
-            logging.info("  completion=%r", completions[0])
 
         if step % train_config.save_every == 0:
             ckpt_dir = train_config.output_dir / f"step_{step}"
