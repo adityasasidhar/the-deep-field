@@ -159,7 +159,7 @@ def compute_ppo_clip_loss(
     advantages: torch.Tensor,      # (B,)   Â*
     attention_mask: torch.Tensor,  # (B, T)
     clip_eps: float,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Standard PPO-clip but with our modified per-sequence advantage.
     The advantage is broadcast from (B,) to (B, T) for token-level updates.
@@ -175,11 +175,19 @@ def compute_ppo_clip_loss(
     # PPO-clip
     unclipped = ratio * adv
     clipped   = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv
-    loss_tok  = -torch.min(unclipped, clipped)       # (B, T)  negative = ascent→descent
+    surrogate = torch.min(unclipped, clipped)        # (B, T)
+    loss_tok  = -surrogate                           # (B, T)  negative = ascent→descent
 
     # Mask and average
     masked = loss_tok * attention_mask
-    return masked.sum() / attention_mask.sum().clamp(min=1.0)
+    masked_surrogate = surrogate * attention_mask
+    denom = attention_mask.sum().clamp(min=1.0)
+    return (
+        masked.sum() / denom,
+        unclipped,
+        clipped,
+        masked_surrogate.sum() / denom,
+    )
 
 
 # ─────────────────────────────────────────────
@@ -226,7 +234,7 @@ def creative_grpo_loss(
     adv_star = compute_creative_advantage(rewards, s, novelty)             # (B,)
 
     # 5. PPO-clip loss with Â*
-    clip_loss = compute_ppo_clip_loss(
+    clip_loss, surr1, surr2, surrogate_mean = compute_ppo_clip_loss(
         token_new_lp, shift_old_log_probs, adv_star, shift_attention_mask, config.clip_eps
     )
 
@@ -239,11 +247,17 @@ def creative_grpo_loss(
     return {
         "loss":         loss,
         "clip_loss":    clip_loss.detach(),
+        "surr1_mean":   surr1.mean().detach(),
+        "surr2_mean":   surr2.mean().detach(),
+        "loss_before_neg": surrogate_mean.detach(),
         "entropy_reg":  entropy_reg.detach(),
         "adv_mean":     adv_star.mean().detach(),
+        "adv_star":     adv_star.detach(),
+        "signs":        s.detach(),
         "sign_mean":    s.mean().detach(),       # negative = batch skewing toward parrot penalty
         "novelty_mean": novelty.mean().detach(),
         "seq_logprob":  seq_lp.mean().detach(),  # calibration diagnostic
+        "seq_logprob_per_seq": seq_lp.detach(),
     }
 
 

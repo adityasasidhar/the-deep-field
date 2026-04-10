@@ -11,6 +11,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from main import CreativeGRPOConfig, creative_grpo_loss
 
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ImportError:  # pragma: no cover - optional dependency
+    plt = None
+
 
 NUMBER_PATTERN = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 BOXED_PATTERN = re.compile(r"\\boxed\{([^}]*)\}")
@@ -334,6 +342,44 @@ def setup_logging(output_dir: Path) -> Path:
     return log_file
 
 
+def save_training_plots(history: list[dict[str, float | int | str]], output_dir: Path) -> None:
+    if plt is None:
+        logging.warning("matplotlib is not installed; skipping training plots")
+        return
+    if not history:
+        logging.warning("No training history collected; skipping training plots")
+        return
+
+    steps = [entry["step"] for entry in history]
+    losses = [entry["loss"] for entry in history]
+    rewards = [entry["reward"] for entry in history]
+    clips = [entry["clip"] for entry in history]
+    entropies = [entry["entropy"] for entry in history]
+    seq_logprobs = [entry["seq_logprob"] for entry in history]
+    adv_means = [entry["adv_mean"] for entry in history]
+    sign_means = [entry["sign_mean"] for entry in history]
+
+    plots = [
+        ("loss_reward", [("loss", losses), ("reward", rewards)], "Training Loss and Reward"),
+        ("optimization", [("clip", clips), ("entropy", entropies)], "Optimization Signals"),
+        ("policy", [("seq_logprob", seq_logprobs), ("adv_mean", adv_means), ("sign_mean", sign_means)], "Policy Signals"),
+    ]
+
+    for filename, series_list, title in plots:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        for label, values in series_list:
+            ax.plot(steps, values, label=label)
+        ax.set_title(title)
+        ax.set_xlabel("step")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        path = output_dir / f"{filename}.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        logging.info("Saved plot to %s", path)
+
+
 # ─────────────────────────────────────────────
 # Main training loop
 # ─────────────────────────────────────────────
@@ -377,6 +423,7 @@ def main() -> None:
     )
 
     curriculum = build_curriculum(train_config)
+    history: list[dict[str, float | int | str]] = []
 
     for step in range(1, train_config.num_steps + 1):
         active_stage = stage_for_step(curriculum, step)
@@ -447,19 +494,57 @@ def main() -> None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
+        avg = train_config.gradient_accumulation_steps
+        metrics = {
+            "step": step,
+            "stage": active_stage.name,
+            "loss": running_loss / avg,
+            "reward": running_reward / avg,
+            "clip": loss_dict["clip_loss"].item(),
+            "loss_before_neg": loss_dict["loss_before_neg"].item(),
+            "surr1_mean": loss_dict["surr1_mean"].item(),
+            "surr2_mean": loss_dict["surr2_mean"].item(),
+            "entropy": loss_dict["entropy_reg"].item(),
+            "seq_logprob": loss_dict["seq_logprob"].item(),
+            "adv_mean": loss_dict["adv_mean"].item(),
+            "sign_mean": loss_dict["sign_mean"].item(),
+            "reward_var": rewards.var(unbiased=False).item(),
+        }
+        history.append(metrics)
+        logging.info(
+            "step=%04d stage=%s loss=%.4f reward=%.4f reward_var=%.4f clip=%.4f loss_before_neg=%.4f surr1_mean=%.4f surr2_mean=%.4f entropy=%.4f seq_logprob=%.4f adv_mean=%.4f sign_mean=%.4f",
+            metrics["step"],
+            metrics["stage"],
+            metrics["loss"],
+            metrics["reward"],
+            metrics["reward_var"],
+            metrics["clip"],
+            metrics["loss_before_neg"],
+            metrics["surr1_mean"],
+            metrics["surr2_mean"],
+            metrics["entropy"],
+            metrics["seq_logprob"],
+            metrics["adv_mean"],
+            metrics["sign_mean"],
+        )
+
         if step % train_config.print_every == 0 or step == 1:
-            avg = train_config.gradient_accumulation_steps
-            logging.info(
-                "step=%04d stage=%s loss=%.4f reward=%.4f clip=%.4f entropy=%.4f seq_logprob=%.4f sign_mean=%.4f",
-                step,
-                active_stage.name,
-                running_loss / avg,
-                running_reward / avg,
-                loss_dict["clip_loss"].item(),
-                loss_dict["entropy_reg"].item(),
-                loss_dict["seq_logprob"].item(),
-                loss_dict["sign_mean"].item(),
-            )
+            adv_star = loss_dict["adv_star"].detach().float().cpu().tolist()
+            rewards_cpu = rewards.detach().float().cpu().tolist()
+            novelty_cpu = novelty.detach().float().cpu().tolist()
+            seq_lp_cpu = loss_dict["seq_logprob_per_seq"].detach().float().cpu().tolist()
+            signs_cpu = loss_dict["signs"].detach().float().cpu().tolist()
+            logging.info("  group_reward_var=%.4f base_adv_norm_mean=%.4f", metrics["reward_var"], metrics["adv_mean"])
+            for i, (a, s, eta, r, lp) in enumerate(zip(adv_star, signs_cpu, novelty_cpu, rewards_cpu, seq_lp_cpu)):
+                logging.info(
+                    "  comp[%d] r=%.3f s=%+.0f eta=%.3f A_hat=%.3f logprob=%.3f",
+                    i,
+                    r,
+                    s,
+                    eta,
+                    a,
+                    lp,
+                )
 
         if step % train_config.save_every == 0:
             ckpt_dir = train_config.output_dir / f"step_{step}"
@@ -473,6 +558,7 @@ def main() -> None:
     model.save_pretrained(final_dir)
     tokenizer.save_pretrained(final_dir)
     logging.info("Saved final model to %s", final_dir)
+    save_training_plots(history, train_config.output_dir)
 
 
 if __name__ == "__main__":
