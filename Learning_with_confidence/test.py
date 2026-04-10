@@ -1,8 +1,8 @@
 import argparse
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import torch
 from datasets import load_dataset
@@ -60,19 +60,15 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--num-steps", default=200, type=int)
     parser.add_argument("--gradient-accumulation-steps", default=4, type=int)
     parser.add_argument("--weight-decay", default=0.01, type=float)
-    parser.add_argument("--temperature", default=0.8, type=float)
-    parser.add_argument("--top-p", default=0.95, type=float)
+    parser.add_argument("--temperature", default=1.0, type=float)
+    parser.add_argument("--top-p", default=0.9, type=float)
     parser.add_argument("--seed", default=7, type=int)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--save-every", default=50, type=int)
     parser.add_argument("--print-every", default=5, type=int)
     parser.add_argument("--gsm8k-start-step", default=1, type=int)
     parser.add_argument("--math-start-step", default=101, type=int)
-    parser.add_argument(
-        "--math-config-name",
-        default="algebra",
-        help="Subset of EleutherAI/hendrycks_math to use. Example: algebra, geometry, number_theory.",
-    )
+    parser.add_argument("--math-config-name", default="algebra")
     parser.add_argument("--train-split", default="train")
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
@@ -101,6 +97,10 @@ def parse_args() -> TrainConfig:
     )
 
 
+# ─────────────────────────────────────────────
+# Answer extraction / reward
+# ─────────────────────────────────────────────
+
 def normalize_numeric_string(value: str) -> str:
     return value.replace(",", "").strip().rstrip(".")
 
@@ -109,14 +109,11 @@ def extract_final_answer(text: str) -> str:
     stripped = text.strip()
     if not stripped:
         return ""
-
     boxed_matches = BOXED_PATTERN.findall(stripped)
     if boxed_matches:
         return boxed_matches[-1].strip()
-
     if "####" in stripped:
         return stripped.split("####")[-1].strip()
-
     final_line = stripped.splitlines()[-1].strip()
     answer_markers = ["answer is", "final answer is", "therefore", "thus", "so the answer is"]
     lowered = final_line.lower()
@@ -124,7 +121,6 @@ def extract_final_answer(text: str) -> str:
         if marker in lowered:
             start = lowered.rfind(marker)
             return final_line[start + len(marker):].strip(" :.-")
-
     return final_line
 
 
@@ -139,9 +135,6 @@ def extract_numeric_answer(text: str) -> str | None:
 
 
 def answers_match(target_text: str, prediction_text: str) -> bool:
-    target_final = extract_final_answer(target_text)
-    prediction_final = extract_final_answer(prediction_text)
-
     target_numeric = extract_numeric_answer(target_text)
     prediction_numeric = extract_numeric_answer(prediction_text)
     if target_numeric is not None and prediction_numeric is not None:
@@ -149,11 +142,14 @@ def answers_match(target_text: str, prediction_text: str) -> bool:
             return abs(float(target_numeric) - float(prediction_numeric)) < 1e-6
         except ValueError:
             pass
+    target_final = extract_final_answer(target_text)
+    prediction_final = extract_final_answer(prediction_text)
+    return normalize_numeric_string(target_final.lower()) == normalize_numeric_string(prediction_final.lower())
 
-    normalized_target = normalize_numeric_string(target_final.lower())
-    normalized_prediction = normalize_numeric_string(prediction_final.lower())
-    return normalized_target == normalized_prediction
 
+# ─────────────────────────────────────────────
+# Data loading
+# ─────────────────────────────────────────────
 
 def format_prompt(question: str) -> str:
     return (
@@ -166,73 +162,46 @@ def format_prompt(question: str) -> str:
 def load_gsm8k_examples(split: str) -> list[dict[str, str]]:
     dataset = load_dataset("openai/gsm8k", "main", split=split)
     return [
-        {
-            "prompt": format_prompt(example["question"]),
-            "answer": extract_final_answer(example["answer"]),
-            "dataset": "gsm8k",
-        }
-        for example in dataset
+        {"prompt": format_prompt(ex["question"]), "answer": extract_final_answer(ex["answer"]), "dataset": "gsm8k"}
+        for ex in dataset
     ]
 
 
 def load_math_examples(split: str, config_name: str) -> list[dict[str, str]]:
     dataset = load_dataset("EleutherAI/hendrycks_math", config_name, split=split)
     return [
-        {
-            "prompt": format_prompt(example["problem"]),
-            "answer": extract_final_answer(example["solution"]),
-            "dataset": f"math/{config_name}",
-        }
-        for example in dataset
+        {"prompt": format_prompt(ex["problem"]), "answer": extract_final_answer(ex["solution"]), "dataset": f"math/{config_name}"}
+        for ex in dataset
     ]
 
 
 def build_curriculum(config: TrainConfig) -> list[DatasetStage]:
     stages = [
-        DatasetStage(
-            name="gsm8k",
-            start_step=config.gsm8k_start_step,
-            examples=load_gsm8k_examples(config.train_split),
-        ),
-        DatasetStage(
-            name=f"math/{config.math_config_name}",
-            start_step=config.math_start_step,
-            examples=load_math_examples(config.train_split, config.math_config_name),
-        ),
+        DatasetStage("gsm8k", config.gsm8k_start_step, load_gsm8k_examples(config.train_split)),
+        DatasetStage(f"math/{config.math_config_name}", config.math_start_step,
+                     load_math_examples(config.train_split, config.math_config_name)),
     ]
-    return sorted(stages, key=lambda stage: stage.start_step)
+    return sorted(stages, key=lambda s: s.start_step)
 
 
 def stage_for_step(stages: list[DatasetStage], step: int) -> DatasetStage:
-    active_stage = stages[0]
+    active = stages[0]
     for stage in stages:
         if step >= stage.start_step:
-            active_stage = stage
+            active = stage
         else:
             break
-    return active_stage
+    return active
 
 
-def cycle_batch(examples: list[dict[str, str]], batch_size: int, offset: int) -> list[dict[str, str]]:
+def cycle_batch(examples: list[dict], batch_size: int, offset: int) -> list[dict]:
     start = (offset * batch_size) % len(examples)
-    return [examples[(start + index) % len(examples)] for index in range(batch_size)]
+    return [examples[(start + i) % len(examples)] for i in range(batch_size)]
 
 
-def tokenize_prompts(
-    tokenizer: AutoTokenizer,
-    prompts: list[str],
-    max_prompt_length: int,
-    device: str,
-) -> dict[str, torch.Tensor]:
-    encoded = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_prompt_length,
-    )
-    return {key: value.to(device) for key, value in encoded.items()}
-
+# ─────────────────────────────────────────────
+# Rollout — FIX 1: return full attention mask, not answer mask
+# ─────────────────────────────────────────────
 
 @torch.no_grad()
 def rollout_from_policy(
@@ -242,9 +211,22 @@ def rollout_from_policy(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+        sequences        (B, T)   full prompt + completion token ids
+        old_log_probs    (B, T)   per-token log-probs under rollout policy (prompt region = 0)
+        full_attn_mask   (B, T)   full attention mask — 1 everywhere except padding
+        answer_mask      (B, T)   1 only on completion tokens (used for confidence / entropy)
+
+    FIX: the forward pass MUST receive full_attn_mask, not answer_mask.
+    answer_mask is passed separately to creative_grpo_loss as the signal mask.
+    Using answer_mask as the model's attention_mask zeroes out the prompt context
+    and causes degenerate logits → NaN loss.
+    """
     was_training = policy.training
     policy.eval()
+
     generated = policy.generate(
         input_ids=prompt_inputs["input_ids"],
         attention_mask=prompt_inputs["attention_mask"],
@@ -257,107 +239,136 @@ def rollout_from_policy(
         return_dict_in_generate=True,
         output_scores=True,
     )
+
     if was_training:
         policy.train()
 
-    sequences = generated.sequences
-    prompt_length = prompt_inputs["input_ids"].shape[1]
-    completion_ids = sequences[:, prompt_length:]
+    sequences = generated.sequences                              # (B, prompt_len + completion_len)
+    prompt_len = prompt_inputs["input_ids"].shape[1]
+    completion_ids = sequences[:, prompt_len:]                  # (B, completion_len)
 
-    old_log_probs = []
-    for score_t, token_t in zip(generated.scores, completion_ids.T):
-        score_log_probs = torch.log_softmax(score_t, dim=-1)
-        old_log_probs.append(score_log_probs.gather(1, token_t.unsqueeze(1)).squeeze(1))
+    # Old log-probs from generation scores (completion tokens only)
+    old_lp_completion = []
+    for score_t, tok_t in zip(generated.scores, completion_ids.T):
+        lp = torch.log_softmax(score_t, dim=-1)
+        old_lp_completion.append(lp.gather(1, tok_t.unsqueeze(1)).squeeze(1))
 
-    if old_log_probs:
-        old_log_probs_tensor = torch.stack(old_log_probs, dim=1)
+    if old_lp_completion:
+        old_lp_completion = torch.stack(old_lp_completion, dim=1)   # (B, completion_len)
     else:
-        old_log_probs_tensor = torch.zeros(
-            sequences.shape[0],
-            0,
-            device=sequences.device,
-            dtype=torch.float32,
-        )
+        old_lp_completion = torch.zeros(sequences.shape[0], 0, device=sequences.device)
 
-    completion_mask = (completion_ids != tokenizer.pad_token_id).float()
-    answer_mask = torch.cat(
-        [torch.zeros_like(prompt_inputs["attention_mask"], dtype=torch.float32), completion_mask],
-        dim=1,
+    # Pad old_log_probs to full sequence length (prompt region = 0, never used in ratio)
+    old_log_probs = torch.cat([
+        torch.zeros(sequences.shape[0], prompt_len, device=sequences.device),
+        old_lp_completion,
+    ], dim=1)                                                    # (B, T)
+
+    # Completion mask: 1 up to and including first EOS, 0 after.
+    # If EOS never appears, keep the entire sampled completion.
+    cumulative_eos = (completion_ids == tokenizer.eos_token_id).long().cumsum(dim=1)
+    completion_mask = (cumulative_eos <= 1).float()
+
+    # answer_mask: prompt region = 0, completion region = completion_mask
+    answer_mask = torch.cat([
+        torch.zeros_like(prompt_inputs["attention_mask"], dtype=torch.float32),
+        completion_mask,
+    ], dim=1)                                                    # (B, T)
+
+    # FIX: full attention mask for forward pass — prompt real tokens + completion tokens
+    full_attn_mask = torch.cat([
+        prompt_inputs["attention_mask"],
+        completion_mask.long(),
+    ], dim=1)                                                    # (B, T)
+
+    return sequences, old_log_probs, full_attn_mask, answer_mask
+
+
+# ─────────────────────────────────────────────
+# Decoding / rewards / novelty
+# ─────────────────────────────────────────────
+
+def decode_completions(tokenizer, sequences, prompt_input_ids) -> list[str]:
+    prompt_len = prompt_input_ids.shape[1]
+    return tokenizer.batch_decode(sequences[:, prompt_len:], skip_special_tokens=True)
+
+
+def compute_rewards(batch: list[dict], completions: list[str]) -> torch.Tensor:
+    return torch.tensor(
+        [1.0 if answers_match(ex["answer"], c) else -1.0 for ex, c in zip(batch, completions)],
+        dtype=torch.float32,
     )
-
-    return sequences, old_log_probs_tensor, answer_mask
-
-
-def decode_completions(
-    tokenizer: AutoTokenizer,
-    sequences: torch.Tensor,
-    prompt_input_ids: torch.Tensor,
-) -> list[str]:
-    prompt_length = prompt_input_ids.shape[1]
-    completion_ids = sequences[:, prompt_length:]
-    return tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-
-
-def compute_rewards(batch: list[dict[str, str]], completions: list[str]) -> torch.Tensor:
-    rewards = []
-    for example, completion in zip(batch, completions):
-        rewards.append(1.0 if answers_match(example["answer"], completion) else -1.0)
-    return torch.tensor(rewards, dtype=torch.float32)
 
 
 def compute_novelty(completions: list[str]) -> torch.Tensor:
-    novelty_scores = []
-    for completion in completions:
-        tokens = completion.split()
+    scores = []
+    for c in completions:
+        tokens = c.split()
         if not tokens:
-            novelty_scores.append(0.25)
-            continue
-        unique_ratio = len(set(tokens)) / len(tokens)
-        novelty_scores.append(0.25 + 0.75 * min(1.0, unique_ratio))
-    return torch.tensor(novelty_scores, dtype=torch.float32)
+            scores.append(0.25)
+        else:
+            scores.append(0.25 + 0.75 * min(1.0, len(set(tokens)) / len(tokens)))
+    return torch.tensor(scores, dtype=torch.float32)
 
 
-def ensure_tokenizer_padding(tokenizer: AutoTokenizer) -> AutoTokenizer:
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
+# ─────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────
+
+def setup_logging(output_dir: Path) -> Path:
+    log_file = output_dir / "train.log"
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    return log_file
 
 
-def save_checkpoint(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    output_dir: Path,
-    step: int,
-) -> None:
-    checkpoint_dir = output_dir / f"step_{step}"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(checkpoint_dir)
-    tokenizer.save_pretrained(checkpoint_dir)
-
+# ─────────────────────────────────────────────
+# Main training loop
+# ─────────────────────────────────────────────
 
 def main() -> None:
     train_config = parse_args()
     torch.manual_seed(train_config.seed)
     train_config.output_dir.mkdir(parents=True, exist_ok=True)
+    log_file = setup_logging(train_config.output_dir)
+    logging.info("Logging to %s", log_file)
+    logging.info("Training config: %s", train_config)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        train_config.model_name,
-        trust_remote_code=train_config.trust_remote_code,
+        train_config.model_name, trust_remote_code=train_config.trust_remote_code
     )
-    tokenizer = ensure_tokenizer_padding(tokenizer)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(
         train_config.model_name,
-        torch_dtype=torch.bfloat16 if train_config.device.startswith("cuda") else torch.float32,
+        dtype=torch.bfloat16 if train_config.device.startswith("cuda") else torch.float32,
         trust_remote_code=train_config.trust_remote_code,
     ).to(train_config.device)
+
+    # FIX 2: Do NOT call model.resize_token_embeddings() unless you actually
+    # added new tokens. Llama-3.2 tokenizer and model vocab are already aligned.
+    # Calling resize re-initializes embedding rows and corrupts weights.
+    # Only uncomment if you explicitly added tokens to the tokenizer:
+    # if len(tokenizer) != model.config.vocab_size:
+    #     model.resize_token_embeddings(len(tokenizer))
+
     model.train()
 
-    optimizer = AdamW(
-        model.parameters(),
-        lr=train_config.learning_rate,
-        weight_decay=train_config.weight_decay,
-    )
+    optimizer = AdamW(model.parameters(), lr=train_config.learning_rate, weight_decay=train_config.weight_decay)
 
     grpo_config = CreativeGRPOConfig(
         clip_eps=0.2,
@@ -376,76 +387,92 @@ def main() -> None:
         for micro_step in range(train_config.gradient_accumulation_steps):
             offset = (step - 1) * train_config.gradient_accumulation_steps + micro_step
             batch = cycle_batch(active_stage.examples, train_config.batch_size, offset)
-            prompts = [example["prompt"] for example in batch]
-            prompt_inputs = tokenize_prompts(
-                tokenizer,
+            prompts = [ex["prompt"] for ex in batch]
+
+            prompt_inputs = tokenizer(
                 prompts,
-                train_config.max_prompt_length,
-                train_config.device,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=train_config.max_prompt_length,
+            )
+            prompt_inputs = {k: v.to(train_config.device) for k, v in prompt_inputs.items()}
+
+            # Rollout → now returns 4 values including proper full_attn_mask
+            sequences, old_log_probs, full_attn_mask, answer_mask = rollout_from_policy(
+                model, tokenizer, prompt_inputs,
+                train_config.max_new_tokens, train_config.temperature, train_config.top_p,
             )
 
-            sequences, old_log_probs, answer_mask = rollout_from_policy(
-                model,
-                tokenizer,
-                prompt_inputs,
-                train_config.max_new_tokens,
-                train_config.temperature,
-                train_config.top_p,
-            )
+            # FIX 1 applied: forward pass gets full_attn_mask (prompt + completion context)
+            # NOT answer_mask (which zeros the prompt and breaks attention)
+            outputs = model(input_ids=sequences, attention_mask=full_attn_mask)
 
-            outputs = model(input_ids=sequences, attention_mask=(sequences != tokenizer.pad_token_id))
             completions = decode_completions(tokenizer, sequences, prompt_inputs["input_ids"])
             rewards = compute_rewards(batch, completions).to(train_config.device)
             novelty = compute_novelty(completions).to(train_config.device)
 
-            padded_old_log_probs = torch.cat(
-                [
-                    torch.zeros(
-                        old_log_probs.shape[0],
-                        prompt_inputs["input_ids"].shape[1],
-                        device=train_config.device,
-                        dtype=old_log_probs.dtype,
-                    ),
-                    old_log_probs,
-                ],
-                dim=1,
-            )
-
+            # FIX 3: pass answer_mask as both attention_mask and answer_mask to the loss.
+            # The loss uses attention_mask to know which positions to include in entropy/ratio,
+            # and answer_mask to know which positions to use for confidence (seq log-prob).
+            # Since we want confidence only over completion tokens, both are answer_mask here.
+            # The log-ratio is also gated by answer_mask — prompt old_log_probs are 0 anyway
+            # but the mask makes the intent explicit and avoids any numerical edge-cases.
             loss_dict = creative_grpo_loss(
                 new_logits=outputs.logits,
-                old_log_probs=padded_old_log_probs,
+                old_log_probs=old_log_probs,
                 input_ids=sequences,
-                attention_mask=answer_mask,
-                answer_mask=answer_mask,
+                attention_mask=answer_mask,   # gates entropy + PPO ratio to completion tokens
+                answer_mask=answer_mask,      # gates confidence (seq log-prob) to answer span
                 rewards=rewards,
                 novelty=novelty,
                 config=grpo_config,
             )
 
+            if not torch.isfinite(loss_dict["loss"]):
+                raise RuntimeError(
+                    "Non-finite Creative GRPO loss detected: "
+                    f"loss={loss_dict['loss'].item()} "
+                    f"clip={loss_dict['clip_loss'].item()} "
+                    f"entropy={loss_dict['entropy_reg'].item()} "
+                    f"seq_logprob={loss_dict['seq_logprob'].item()} "
+                    f"reward_mean={rewards.mean().item()} "
+                    f"novelty_mean={novelty.mean().item()}"
+                )
+
             (loss_dict["loss"] / train_config.gradient_accumulation_steps).backward()
             running_loss += loss_dict["loss"].item()
             running_reward += rewards.mean().item()
 
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         if step % train_config.print_every == 0 or step == 1:
-            print(
-                f"step={step:04d} "
-                f"stage={active_stage.name} "
-                f"loss={running_loss / train_config.gradient_accumulation_steps:.4f} "
-                f"reward={running_reward / train_config.gradient_accumulation_steps:.4f} "
+            avg = train_config.gradient_accumulation_steps
+            message = (
+                f"step={step:04d} stage={active_stage.name} "
+                f"loss={running_loss / avg:.4f} reward={running_reward / avg:.4f} "
                 f"clip={loss_dict['clip_loss'].item():.4f} "
                 f"entropy={loss_dict['entropy_reg'].item():.4f} "
                 f"seq_logprob={loss_dict['seq_logprob'].item():.4f} "
                 f"sign_mean={loss_dict['sign_mean'].item():.4f}"
             )
-            print(f"target={batch[0]['answer']!r}")
-            print(f"sample_completion={completions[0]!r}")
+            logging.info(message)
+            logging.info("  target=%r", batch[0]["answer"])
+            logging.info("  completion=%r", completions[0])
 
         if step % train_config.save_every == 0:
-            save_checkpoint(model, tokenizer, train_config.output_dir, step)
+            ckpt_dir = train_config.output_dir / f"step_{step}"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(ckpt_dir)
+            tokenizer.save_pretrained(ckpt_dir)
+            logging.info("Saved checkpoint to %s", ckpt_dir)
 
-    save_checkpoint(model, tokenizer, train_config.output_dir, train_config.num_steps)
+    final_dir = train_config.output_dir / f"step_{train_config.num_steps}"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
+    logging.info("Saved final model to %s", final_dir)
 
 
 if __name__ == "__main__":

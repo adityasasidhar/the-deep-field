@@ -62,7 +62,7 @@ def compute_sequence_logprob(
 
     Returns: (B,) mean log-prob per sequence over answer tokens
     """
-    log_probs = F.log_softmax(logits, dim=-1)                          # (B, T, V)
+    log_probs = F.log_softmax(logits.float(), dim=-1)                  # (B, T, V)
     token_log_probs = log_probs.gather(
         2, input_ids.unsqueeze(-1)                                     # (B, T, 1)
     ).squeeze(-1)                                                       # (B, T)
@@ -138,8 +138,9 @@ def compute_entropy_regularizer(
     Returns scalar: mean token-level entropy over the batch.
     Higher = more spread distribution = more "creative" token choices.
     """
-    probs     = F.softmax(logits, dim=-1)            # (B, T, V)
-    log_probs = F.log_softmax(logits, dim=-1)        # (B, T, V)
+    logits_fp32 = logits.float()
+    probs     = F.softmax(logits_fp32, dim=-1)       # (B, T, V)
+    log_probs = F.log_softmax(logits_fp32, dim=-1)   # (B, T, V)
     entropy   = -(probs * log_probs).sum(dim=-1)     # (B, T)  per-token entropy
 
     # Average only over generated (non-padding) tokens
@@ -164,7 +165,8 @@ def compute_ppo_clip_loss(
     The advantage is broadcast from (B,) to (B, T) for token-level updates.
     """
     # Per-token importance ratio ρ_i = π_θ(a|s) / π_θ_old(a|s)
-    log_ratio = new_log_probs - old_log_probs        # (B, T)
+    # Clamp before exp to avoid overflow; inf * 0 in the PPO term becomes NaN.
+    log_ratio = (new_log_probs - old_log_probs).clamp(min=-20.0, max=20.0)  # (B, T)
     ratio     = torch.exp(log_ratio)                 # (B, T)
 
     # Broadcast advantage to token level
@@ -202,13 +204,20 @@ def creative_grpo_loss(
     Returns dict with scalar 'loss' and diagnostic keys.
     """
 
+    # Align causal-LM logits with the next-token labels they actually score.
+    shift_logits = new_logits[:, :-1, :]
+    shift_input_ids = input_ids[:, 1:]
+    shift_attention_mask = attention_mask[:, 1:]
+    shift_answer_mask = answer_mask[:, 1:]
+    shift_old_log_probs = old_log_probs[:, 1:]
+
     # 1. Log-probs under new policy
-    new_log_probs = F.log_softmax(new_logits, dim=-1)       # (B, T, V)
+    new_log_probs = F.log_softmax(shift_logits.float(), dim=-1)       # (B, T-1, V)
     token_new_lp  = new_log_probs.gather(
-        2, input_ids.unsqueeze(-1)).squeeze(-1)             # (B, T)
+        2, shift_input_ids.unsqueeze(-1)).squeeze(-1)                 # (B, T-1)
 
     # 2. Confidence: mean log-prob over answer span
-    seq_lp = compute_sequence_logprob(new_logits, input_ids, answer_mask)  # (B,)
+    seq_lp = compute_sequence_logprob(shift_logits, shift_input_ids, shift_answer_mask)  # (B,)
 
     # 3. Sign function
     s = compute_sign(seq_lp, rewards, config.confidence_threshold)         # (B,)
@@ -218,11 +227,11 @@ def creative_grpo_loss(
 
     # 5. PPO-clip loss with Â*
     clip_loss = compute_ppo_clip_loss(
-        token_new_lp, old_log_probs, adv_star, attention_mask, config.clip_eps
+        token_new_lp, shift_old_log_probs, adv_star, shift_attention_mask, config.clip_eps
     )
 
     # 6. Entropy regularizer (replaces KL penalty)
-    entropy_reg = compute_entropy_regularizer(new_logits, attention_mask)
+    entropy_reg = compute_entropy_regularizer(shift_logits, shift_attention_mask)
 
     # 7. Final objective (maximize → negate clip_loss already done inside)
     loss = clip_loss - config.lambda_entropy * entropy_reg   # - because we maximize entropy
