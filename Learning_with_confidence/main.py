@@ -32,6 +32,7 @@ class CreativeGRPOConfig:
 
     # Confidence threshold: sequence log-prob above this → "confident"
     confidence_threshold: float = -1.5           # tune per model
+    adaptive_confidence_threshold: bool = True
 
     # Novelty score placeholder (inject computed η externally or use dummy)
     novelty_score_default: float = 1.0
@@ -44,6 +45,9 @@ class CreativeGRPOConfig:
 
     # Optional: weight for ECE-calibrated confidence correction
     use_calibration_weight: bool = False
+
+    # Small penalty for wrong answers so fully-wrong batches still produce gradient.
+    wrong_penalty: float = 0.1
 
 
 # ─────────────────────────────────────────────
@@ -81,7 +85,8 @@ def compute_sign(
     seq_logprob: torch.Tensor,   # (B,) confidence proxy
     rewards: torch.Tensor,       # (B,) ∈ [-1, 1]
     threshold: float,
-) -> torch.Tensor:
+    adaptive: bool = True,
+) -> tuple[torch.Tensor, float]:
     """
     s_i = +1  if uncertain (logprob < threshold) AND correct   (reward > 0)
     s_i = -1  if confident  (logprob ≥ threshold) AND correct  (reward > 0)
@@ -93,6 +98,13 @@ def compute_sign(
       - Rewards creative-correct outputs (low confidence, right answer)
       - Keeps standard gradient signal for wrong outputs
     """
+    if adaptive:
+        correct_mask = rewards > 0
+        if correct_mask.any():
+            threshold = seq_logprob[correct_mask].median().item()
+        else:
+            threshold = seq_logprob.median().item()
+
     confident = (seq_logprob >= threshold)          # (B,) bool
     correct    = (rewards > 0)                      # (B,) bool
     parrot     = confident & correct                # confident-AND-correct → penalize
@@ -101,7 +113,7 @@ def compute_sign(
     s = torch.ones_like(rewards)                    # default +1
     s[parrot]  = -1.0
     s[creative] = +1.0
-    return s                                        # (B,)
+    return s, float(threshold)                      # (B,)
 
 
 # ─────────────────────────────────────────────
@@ -112,15 +124,16 @@ def compute_creative_advantage(
     rewards: torch.Tensor,       # (B,)  ∈ [-1, 1]
     sign: torch.Tensor,          # (B,)  ∈ {-1, +1}
     novelty: torch.Tensor,       # (B,)  ∈ [0, 1]
+    wrong_penalty: float = 0.1,
 ) -> torch.Tensor:
     """
-    Â*_i = s_i · η_i · (1 + r_i)
-
-    Note: (1 + r_i) shifts the reward to [0, 2] so that correct outputs
-    amplify signal and incorrect outputs near r=-1 contribute ≈0 regardless of sign.
-    This is intentional: we only want to reward/penalize when there's a meaningful signal.
+    Correct outputs get the creativity-shaped signal. Wrong outputs receive a
+    small constant penalty so fully-wrong batches still provide learning signal.
     """
-    return sign * novelty * (1.0 + rewards)         # (B,)
+    correct = (rewards > 0).float()
+    creative_term = sign * novelty * (1.0 + rewards) * correct
+    wrong_term = -wrong_penalty * (1.0 - correct)
+    return creative_term + wrong_term               # (B,)
 
 
 # ─────────────────────────────────────────────
@@ -228,10 +241,20 @@ def creative_grpo_loss(
     seq_lp = compute_sequence_logprob(shift_logits, shift_input_ids, shift_answer_mask)  # (B,)
 
     # 3. Sign function
-    s = compute_sign(seq_lp, rewards, config.confidence_threshold)         # (B,)
+    s, effective_threshold = compute_sign(
+        seq_lp,
+        rewards,
+        config.confidence_threshold,
+        adaptive=config.adaptive_confidence_threshold,
+    )                                                                       # (B,)
 
     # 4. Modified advantage Â* = s_i · η_i · (1 + r_i)
-    adv_star = compute_creative_advantage(rewards, s, novelty)             # (B,)
+    adv_star = compute_creative_advantage(
+        rewards,
+        s,
+        novelty,
+        wrong_penalty=config.wrong_penalty,
+    )                                                                       # (B,)
 
     # 5. PPO-clip loss with Â*
     clip_loss, surr1, surr2, surrogate_mean = compute_ppo_clip_loss(
@@ -258,6 +281,9 @@ def creative_grpo_loss(
         "novelty_mean": novelty.mean().detach(),
         "seq_logprob":  seq_lp.mean().detach(),  # calibration diagnostic
         "seq_logprob_per_seq": seq_lp.detach(),
+        "effective_threshold": torch.tensor(effective_threshold, device=seq_lp.device).detach(),
+        "seq_logprob_min": seq_lp.min().detach(),
+        "seq_logprob_max": seq_lp.max().detach(),
     }
 
 

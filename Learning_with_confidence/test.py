@@ -430,6 +430,11 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
         running_reward = 0.0
+        running_correct_fraction = 0.0
+        running_reward_var = 0.0
+        running_threshold = 0.0
+        running_seq_lp_min = float("inf")
+        running_seq_lp_max = float("-inf")
 
         for micro_step in range(train_config.gradient_accumulation_steps):
             offset = (step - 1) * train_config.gradient_accumulation_steps + micro_step
@@ -490,6 +495,11 @@ def main() -> None:
             (loss_dict["loss"] / train_config.gradient_accumulation_steps).backward()
             running_loss += loss_dict["loss"].item()
             running_reward += rewards.mean().item()
+            running_correct_fraction += (rewards > 0).float().mean().item()
+            running_reward_var += rewards.var(unbiased=False).item()
+            running_threshold += loss_dict["effective_threshold"].item()
+            running_seq_lp_min = min(running_seq_lp_min, loss_dict["seq_logprob_min"].item())
+            running_seq_lp_max = max(running_seq_lp_max, loss_dict["seq_logprob_max"].item())
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -500,23 +510,28 @@ def main() -> None:
             "stage": active_stage.name,
             "loss": running_loss / avg,
             "reward": running_reward / avg,
+            "correct_fraction": running_correct_fraction / avg,
             "clip": loss_dict["clip_loss"].item(),
             "loss_before_neg": loss_dict["loss_before_neg"].item(),
             "surr1_mean": loss_dict["surr1_mean"].item(),
             "surr2_mean": loss_dict["surr2_mean"].item(),
             "entropy": loss_dict["entropy_reg"].item(),
             "seq_logprob": loss_dict["seq_logprob"].item(),
+            "effective_threshold": running_threshold / avg,
+            "seq_logprob_min": running_seq_lp_min,
+            "seq_logprob_max": running_seq_lp_max,
             "adv_mean": loss_dict["adv_mean"].item(),
             "sign_mean": loss_dict["sign_mean"].item(),
-            "reward_var": rewards.var(unbiased=False).item(),
+            "reward_var": running_reward_var / avg,
         }
         history.append(metrics)
         logging.info(
-            "step=%04d stage=%s loss=%.4f reward=%.4f reward_var=%.4f clip=%.4f loss_before_neg=%.4f surr1_mean=%.4f surr2_mean=%.4f entropy=%.4f seq_logprob=%.4f adv_mean=%.4f sign_mean=%.4f",
+            "step=%04d stage=%s loss=%.4f reward=%.4f correct_fraction=%.3f reward_var=%.4f clip=%.4f loss_before_neg=%.4f surr1_mean=%.4f surr2_mean=%.4f entropy=%.4f seq_logprob=%.4f effective_threshold=%.4f seq_lp_min=%.4f seq_lp_max=%.4f adv_mean=%.4f sign_mean=%.4f",
             metrics["step"],
             metrics["stage"],
             metrics["loss"],
             metrics["reward"],
+            metrics["correct_fraction"],
             metrics["reward_var"],
             metrics["clip"],
             metrics["loss_before_neg"],
@@ -524,6 +539,9 @@ def main() -> None:
             metrics["surr2_mean"],
             metrics["entropy"],
             metrics["seq_logprob"],
+            metrics["effective_threshold"],
+            metrics["seq_logprob_min"],
+            metrics["seq_logprob_max"],
             metrics["adv_mean"],
             metrics["sign_mean"],
         )
